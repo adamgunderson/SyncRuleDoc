@@ -84,6 +84,82 @@ Get detailed logging output:
 python3.12 sync_ruledoc.py --debug
 ```
 
+### Running as a Cron Job
+
+To automatically sync rule documentation on a schedule, set up a cron job:
+
+1. **Edit the crontab**:
+   ```bash
+   crontab -e
+   ```
+
+2. **Add a cron entry**. Examples:
+
+   **Run every day at 2:00 AM:**
+   ```cron
+   0 2 * * * cd /path/to/script && /usr/bin/python3.12 /path/to/script/sync_ruledoc.py >> /var/log/sync_ruledoc_cron.log 2>&1
+   ```
+
+   **Run every 6 hours:**
+   ```cron
+   0 */6 * * * cd /path/to/script && /usr/bin/python3.12 /path/to/script/sync_ruledoc.py >> /var/log/sync_ruledoc_cron.log 2>&1
+   ```
+
+   **Run every Monday at 3:00 AM:**
+   ```cron
+   0 3 * * 1 cd /path/to/script && /usr/bin/python3.12 /path/to/script/sync_ruledoc.py >> /var/log/sync_ruledoc_cron.log 2>&1
+   ```
+
+3. **Environment variables in cron**: Since cron jobs don't inherit your environment, you have two options:
+
+   **Option A: Use a wrapper script**
+
+   Create `/path/to/script/sync_ruledoc_wrapper.sh`:
+   ```bash
+   #!/bin/bash
+   export FIREMON_URL="https://your-firemon-server.com"
+   export FIREMON_USER="your-username"
+   export FIREMON_PASSWORD='your-password'
+   export FIREMON_DOMAIN_ID="1"
+   export FIREMON_LOG_FILE="/var/log/firemon/sync_ruledoc.log"
+
+   cd /path/to/script
+   /usr/bin/python3.12 /path/to/script/sync_ruledoc.py
+   ```
+
+   Make it executable:
+   ```bash
+   chmod +x /path/to/script/sync_ruledoc_wrapper.sh
+   ```
+
+   Cron entry:
+   ```cron
+   0 2 * * * /path/to/script/sync_ruledoc_wrapper.sh >> /var/log/sync_ruledoc_cron.log 2>&1
+   ```
+
+   **Option B: Set environment variables in crontab**
+   ```cron
+   FIREMON_URL=https://your-firemon-server.com
+   FIREMON_USER=your-username
+   FIREMON_PASSWORD=your-password
+   FIREMON_DOMAIN_ID=1
+   FIREMON_LOG_FILE=/var/log/firemon/sync_ruledoc.log
+
+   0 2 * * * cd /path/to/script && /usr/bin/python3.12 /path/to/script/sync_ruledoc.py >> /var/log/sync_ruledoc_cron.log 2>&1
+   ```
+
+4. **Verify cron job is running**:
+   ```bash
+   # List current cron jobs
+   crontab -l
+
+   # Check cron logs
+   grep CRON /var/log/cron
+
+   # Check script output
+   tail -f /var/log/sync_ruledoc_cron.log
+   ```
+
 ## How It Works
 
 1. **Discovery**: Queries FireMon for all management stations (or a specific one)
@@ -229,4 +305,14 @@ For issues or questions:
 
 ## License
 
-Internal use only.
+**Use at your own risk. No warranty provided.**
+
+This script is provided "as is" without warranty of any kind, either express or implied, including but not limited to the implied warranties of merchantability and fitness for a particular purpose. The author assumes no responsibility for errors or omissions in this script or documentation.
+
+In no event shall the author be liable for any special, direct, indirect, consequential, or incidental damages or any damages whatsoever, whether in an action of contract, negligence or other tort, arising out of or in connection with the use of this script or the performance of this script.
+
+**By using this script, you acknowledge that:**
+- You have tested it thoroughly in a non-production environment
+- You understand the changes it will make to your FireMon configuration
+- You accept full responsibility for any outcomes resulting from its use
+- You will maintain appropriate backups before running the script
