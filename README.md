@@ -57,7 +57,7 @@ export FIREMON_VERIFY_SSL="false"               # Default: false
 Before running a sync, test your connection:
 
 ```bash
-python3 sync_ruledoc.py --test
+python3.12 sync_ruledoc.py --test
 ```
 
 ### Sync All Management Stations
@@ -65,7 +65,7 @@ python3 sync_ruledoc.py --test
 Sync all management stations in the domain:
 
 ```bash
-python3 sync_ruledoc.py
+python3.12 sync_ruledoc.py
 ```
 
 ### Sync Specific Management Station
@@ -73,7 +73,7 @@ python3 sync_ruledoc.py
 Sync only a specific management station by ID:
 
 ```bash
-python3 sync_ruledoc.py --mgmt-id 1289
+python3.12 sync_ruledoc.py --mgmt-id 1289
 ```
 
 ### Enable Debug Logging
@@ -81,7 +81,7 @@ python3 sync_ruledoc.py --mgmt-id 1289
 Get detailed logging output:
 
 ```bash
-python3 sync_ruledoc.py --debug
+python3.12 sync_ruledoc.py --debug
 ```
 
 ## How It Works
@@ -166,7 +166,7 @@ Logs are written to both console and a log file. Log levels:
 
 ```bash
 # Verify credentials
-python3 sync_ruledoc.py --test
+python3.12 sync_ruledoc.py --test
 
 # Check environment variables
 echo $FIREMON_URL
