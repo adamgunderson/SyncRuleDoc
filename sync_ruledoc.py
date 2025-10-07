@@ -757,7 +757,23 @@ class RuleDocSyncer:
             if prop_type == 'STRING':
                 prop_obj['stringval'] = str(value)
             elif prop_type == 'STRING_ARRAY':
-                prop_obj['stringarray'] = [str(value)] if not isinstance(value, list) else value
+                # Handle different formats for string arrays
+                if isinstance(value, list):
+                    prop_obj['stringarray'] = value
+                elif isinstance(value, str):
+                    # Check if it's in the format "{item1, item2}" or "{item1}"
+                    if value.startswith('{') and value.endswith('}'):
+                        # Remove curly braces and split by comma
+                        inner_value = value[1:-1].strip()
+                        if inner_value:
+                            prop_obj['stringarray'] = [s.strip() for s in inner_value.split(',')]
+                        else:
+                            prop_obj['stringarray'] = []
+                    else:
+                        # Just a plain string, wrap in array
+                        prop_obj['stringarray'] = [value]
+                else:
+                    prop_obj['stringarray'] = [str(value)]
             elif prop_type == 'INTEGER':
                 prop_obj['intval'] = int(value)
             elif prop_type == 'LONG':
@@ -767,14 +783,69 @@ class RuleDocSyncer:
             elif prop_type == 'BOOLEAN':
                 prop_obj['boolval'] = bool(value)
             elif prop_type == 'DATE':
-                prop_obj['dateval'] = str(value)
+                # The API expects ISO 8601 format: YYYY-MM-DDTHH:mm:ss±HHMM
+                # Example: "2025-10-10T00:00:00-0700"
+                prop_obj['dateval'] = self._format_date_iso8601(str(value))
             else:
                 prop_obj['stringval'] = str(value)
 
             props_list.append(prop_obj)
 
         return props_list
-    
+
+    def _format_date_iso8601(self, date_str: str) -> str:
+        """
+        Convert a date string to ISO 8601 format with timezone.
+
+        Args:
+            date_str: Date string in various formats (e.g., "2022-03-12 00:00:00")
+
+        Returns:
+            ISO 8601 formatted string (e.g., "2022-03-12T00:00:00-0700")
+        """
+        from datetime import datetime
+        import time
+
+        try:
+            # Replace space with T if present
+            if ' ' in date_str and 'T' not in date_str:
+                date_str = date_str.replace(' ', 'T')
+
+            # Parse the date string - try common formats
+            date_obj = None
+            for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d']:
+                try:
+                    # Strip any existing timezone info
+                    clean_str = date_str.split('+')[0].split('-', 3)[0] if date_str.count('-') > 2 else date_str
+                    clean_str = clean_str.split('+')[0].split('Z')[0]
+                    date_obj = datetime.strptime(clean_str, fmt)
+                    break
+                except ValueError:
+                    continue
+
+            if not date_obj:
+                raise ValueError(f"Unable to parse date: {date_str}")
+
+            # Get local timezone offset
+            if time.daylight:
+                offset_sec = -time.altzone
+            else:
+                offset_sec = -time.timezone
+
+            offset_hours = offset_sec // 3600
+            offset_minutes = (abs(offset_sec) % 3600) // 60
+            offset_sign = '+' if offset_sec >= 0 else '-'
+
+            # Format as YYYY-MM-DDTHH:mm:ss±HHMM
+            formatted = date_obj.strftime('%Y-%m-%dT%H:%M:%S')
+            formatted += f"{offset_sign}{abs(offset_hours):02d}{offset_minutes:02d}"
+
+            return formatted
+
+        except Exception as e:
+            logging.warning(f"Failed to parse date: {date_str}, using as-is. Error: {e}")
+            return date_str
+
     def get_management_stations(self) -> List[Dict[str, Any]]:
         """Get all management stations in the domain."""
         logging.info("Fetching management stations...")
@@ -929,7 +1000,18 @@ class RuleDocSyncer:
             logging.debug(f"Converting props dict to list format for rule '{child_rule.get('displayName')}'")
             mgmt_props = self._convert_props_dict_to_list(mgmt_props_raw, child_rule['matchId'])
         elif isinstance(mgmt_props_raw, list):
-            mgmt_props = mgmt_props_raw
+            # Props are already in list format, but need to update ruleId to child rule ID
+            # and fix date formatting
+            mgmt_props = []
+            for prop in mgmt_props_raw:
+                updated_prop = prop.copy()
+                updated_prop['ruleId'] = child_rule['matchId']
+
+                # Fix date format if this is a DATE property
+                if 'dateval' in updated_prop and isinstance(updated_prop['dateval'], str):
+                    updated_prop['dateval'] = self._format_date_iso8601(updated_prop['dateval'])
+
+                mgmt_props.append(updated_prop)
         else:
             logging.error(f"Props is not a dict or list: {type(mgmt_props_raw)}")
             return False
@@ -942,11 +1024,21 @@ class RuleDocSyncer:
         if isinstance(child_props_raw, dict):
             child_props = self._convert_props_dict_to_list(child_props_raw, child_rule['matchId'])
         elif isinstance(child_props_raw, list):
-            child_props = child_props_raw if child_props_raw else []
+            # Also fix date formatting in child props for comparison
+            child_props = []
+            for prop in child_props_raw:
+                updated_prop = prop.copy()
+                updated_prop['ruleId'] = child_rule['matchId']
+
+                # Fix date format if this is a DATE property
+                if 'dateval' in updated_prop and isinstance(updated_prop['dateval'], str):
+                    updated_prop['dateval'] = self._format_date_iso8601(updated_prop['dateval'])
+
+                child_props.append(updated_prop)
         else:
             child_props = []
 
-        # Check if props are different (simple length check for now)
+        # Check if props are different
         if mgmt_props == child_props:
             logging.debug(f"Props already in sync for rule '{child_rule.get('displayName')}' on {child_device_name}")
             return True
