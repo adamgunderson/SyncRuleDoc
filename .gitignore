@@ -2,3 +2,6 @@ reference.md
 sync-ruledoc.js
 openapi-sm.json
 *.log
+*.pdf
+api-response
+/.claude

@@ -113,6 +113,14 @@ def load_config() -> Dict[str, Any]:
 
 def setup_logging(log_filename: str, log_level: int, max_bytes: int = 10485760, backup_count: int = 5) -> None:
     """Configure logging with proper format and rotation."""
+    # Configure root logger
+    root_logger = logging.getLogger()
+
+    # Clear any existing handlers to prevent duplicates
+    root_logger.handlers.clear()
+
+    root_logger.setLevel(log_level)
+
     # Create formatter
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
@@ -130,9 +138,6 @@ def setup_logging(log_filename: str, log_level: int, max_bytes: int = 10485760, 
     console_handler.setFormatter(formatter)
     console_handler.setLevel(log_level)
 
-    # Configure root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(log_level)
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
 
@@ -371,6 +376,21 @@ class FireMonClient:
         url = f'{self.api_url}/domain/{domain_id}/device/{device_id}'
         return self._get(url)
     
+    def get_rule_doc(self, domain_id: int, device_id: int, rule_id: str) -> Dict[str, Any]:
+        """
+        Get a rule document (props) - returns current/actual props, not cached SIQL data.
+
+        Args:
+            domain_id: Domain ID
+            device_id: Device ID
+            rule_id: Rule ID (matchId)
+
+        Returns:
+            Rule document dictionary
+        """
+        url = f'{self.api_url}/domain/{domain_id}/device/{device_id}/rule/{rule_id}/ruledoc'
+        return self._get(url)
+
     def update_rule_doc(self, domain_id: int, device_id: int,
                        rule_doc: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -473,7 +493,6 @@ class RuleMatcher:
         - Sources
         - Destinations
         - Services
-        - Direction
 
         Args:
             rule1: First rule to compare
@@ -487,21 +506,16 @@ class RuleMatcher:
             self.logger.debug(f"  Rule name mismatch: '{rule1.get('ruleName')}' vs '{rule2.get('ruleName')}'")
             return False
 
-        # Check policy name
-        policy1 = rule1.get('policy', {}).get('name', '')
-        policy2 = rule2.get('policy', {}).get('name', '')
-        if not self._compare_strings(policy1, policy2):
-            self.logger.debug(f"  Policy name mismatch: '{policy1}' vs '{policy2}'")
-            return False
+        # Check policy name - SKIPPED due to FireMon bug in policy name filter
+        # policy1 = rule1.get('policy', {}).get('name', '')
+        # policy2 = rule2.get('policy', {}).get('name', '')
+        # if not self._compare_strings(policy1, policy2):
+        #     self.logger.debug(f"  Policy name mismatch: '{policy1}' vs '{policy2}'")
+        #     return False
 
         # Check rule action
         if rule1.get('ruleAction') != rule2.get('ruleAction'):
             self.logger.debug(f"  Action mismatch: '{rule1.get('ruleAction')}' vs '{rule2.get('ruleAction')}'")
-            return False
-
-        # Check direction
-        if rule1.get('direction') != rule2.get('direction'):
-            self.logger.debug(f"  Direction mismatch: '{rule1.get('direction')}' vs '{rule2.get('direction')}'")
             return False
 
         # Check sources
@@ -808,6 +822,166 @@ class RuleDocSyncer:
 
         return props_list
 
+    def _merge_props_for_sync(self, props_dict: Dict[str, Any], all_props_list: List[Dict[str, Any]],
+                              rule_id: str) -> List[Dict[str, Any]]:
+        """
+        Merge property values with the full list of properties.
+
+        This creates a list of ALL properties in the system, with values from props_dict
+        where available, and without value fields (cleared) where not available.
+
+        Args:
+            props_dict: Dictionary of property key -> value (from SIQL dict format)
+            all_props_list: List of all property definitions (from child device ruledoc API)
+            rule_id: Rule ID for the props
+
+        Returns:
+            List of property objects in API format
+        """
+        if not all_props_list:
+            # No properties defined in system, convert props_dict to list
+            if not props_dict:
+                return []
+            return self._convert_props_dict_to_list(props_dict, rule_id)
+
+        merged_props = []
+
+        for prop_def in all_props_list:
+            # Get the property key
+            prop_key = prop_def.get('ruleCustomPropertyDefinition', {}).get('key') or \
+                      prop_def.get('customProperty', {}).get('key')
+
+            if not prop_key:
+                continue
+
+            # Check if this property has a value in props_dict
+            if prop_key in props_dict and props_dict[prop_key] is not None:
+                # Property has a value in the dict (simple value like string, date, etc.)
+                # Convert it to full property object format
+                single_prop_dict = {prop_key: props_dict[prop_key]}
+                converted = self._convert_props_dict_to_list(single_prop_dict, rule_id)
+                if converted:
+                    merged_props.extend(converted)
+            else:
+                # Property doesn't have a value, add definition without value field
+                empty_prop = {
+                    'ruleId': rule_id,
+                    'ruleCustomPropertyDefinition': prop_def.get('ruleCustomPropertyDefinition'),
+                    'customProperty': prop_def.get('customProperty')
+                }
+                merged_props.append(empty_prop)
+
+        return merged_props
+
+    def _create_empty_props_list(self, child_props_raw: Any, rule_id: str) -> List[Dict[str, Any]]:
+        """
+        Create a list of props with empty values to clear properties on child device.
+
+        The FireMon API doesn't support sending an empty array to clear all props.
+        Instead, we need to send the property definitions with empty/null values.
+
+        Args:
+            child_props_raw: Current props from child device (dict or list)
+            rule_id: Rule ID for the props
+
+        Returns:
+            List of property objects with empty values
+        """
+        if not child_props_raw:
+            # Child has no props, return empty list
+            return []
+
+        # Convert child props to list format if needed
+        if isinstance(child_props_raw, dict):
+            child_props = self._convert_props_dict_to_list(child_props_raw, rule_id)
+        elif isinstance(child_props_raw, list):
+            child_props = child_props_raw
+        else:
+            return []
+
+        # Create props with empty values
+        # Note: To clear a property value, we OMIT the value field entirely (don't set to null or empty string)
+        empty_props = []
+        for prop in child_props:
+            # Create a clean copy with only the structure, no value fields
+            empty_prop = {
+                'ruleId': rule_id,
+                'ruleCustomPropertyDefinition': prop.get('ruleCustomPropertyDefinition'),
+                'customProperty': prop.get('customProperty')
+            }
+
+            # Explicitly remove all value fields to clear the property
+            # Do NOT include: stringval, stringarray, integerval, booleanval, dateval, usernameval
+
+            empty_props.append(empty_prop)
+
+        return empty_props
+
+    def _create_rule_match_key(self, rule: Dict[str, Any]) -> tuple:
+        """
+        Create a composite key for matching rules based on multiple attributes.
+        Uses rule name, policy name, action, source zones, destination zones, and services.
+
+        Args:
+            rule: Rule dictionary
+
+        Returns:
+            Tuple containing (rule_name, policy_name, action, src_zones, dst_zones, services)
+        """
+        rule_name = rule.get('displayName', '')
+        policy_name = rule.get('policy', {}).get('displayName', '')
+        action = rule.get('action', '')
+
+        # Extract source zone names (sorted for consistent matching)
+        src_zones = []
+        sources = rule.get('sources', {})
+        if isinstance(sources, dict):
+            zone_list = sources.get('zone', [])
+        else:
+            # sources might be a list directly
+            zone_list = sources if isinstance(sources, list) else []
+
+        for zone in zone_list:
+            if isinstance(zone, dict) and zone.get('type') != 'ANY':
+                zone_name = zone.get('displayName') or zone.get('name', '')
+                if zone_name:
+                    src_zones.append(zone_name)
+        src_zones_tuple = tuple(sorted(src_zones))
+
+        # Extract destination zone names (sorted for consistent matching)
+        dst_zones = []
+        destinations = rule.get('destinations', {})
+        if isinstance(destinations, dict):
+            zone_list = destinations.get('zone', [])
+        else:
+            # destinations might be a list directly
+            zone_list = destinations if isinstance(destinations, list) else []
+
+        for zone in zone_list:
+            if isinstance(zone, dict) and zone.get('type') != 'ANY':
+                zone_name = zone.get('displayName') or zone.get('name', '')
+                if zone_name:
+                    dst_zones.append(zone_name)
+        dst_zones_tuple = tuple(sorted(dst_zones))
+
+        # Extract service names (sorted for consistent matching)
+        services_list = []
+        services = rule.get('services', {})
+        if isinstance(services, dict):
+            svc_list = services.get('service', [])
+        else:
+            # services might be a list directly
+            svc_list = services if isinstance(services, list) else []
+
+        for svc in svc_list:
+            if isinstance(svc, dict) and svc.get('type') != 'ANY':
+                svc_name = svc.get('displayName') or svc.get('name', '')
+                if svc_name:
+                    services_list.append(svc_name)
+        services_tuple = tuple(sorted(services_list))
+
+        return (rule_name, policy_name, action, src_zones_tuple, dst_zones_tuple, services_tuple)
+
     def _format_date_iso8601(self, date_str: str) -> str:
         """
         Convert a date string to ISO 8601 format with timezone (no microseconds).
@@ -897,28 +1071,135 @@ class RuleDocSyncer:
     def get_rules_with_props(self, device_id: int, device_name: str) -> List[Dict[str, Any]]:
         """Get all rules with their props for a device."""
         logging.info(f"Fetching rules for device '{device_name}' (ID: {device_id})...")
-        
+
         # Query includes props field to get custom properties
-        query = f"device{{id={device_id}}} | fields(tfacount, props, controlstat, usage(date('last 30 days')), change, highlight)"
-        
+        query = f"device{{id={device_id}}} | fields(props)"
+
         try:
             rules = self.client.search_rules(query)
             logging.info(f"Found {len(rules)} rule(s) on device '{device_name}'")
-            
+
             # Count rules with props
             rules_with_props = sum(1 for rule in rules if rule.get('props'))
             logging.info(f"  {rules_with_props} rule(s) have custom properties")
-            
+
             return rules
         except Exception as e:
             logging.error(f"Error fetching rules for device {device_id}: {e}")
             return []
+
+    def find_matching_rule_by_siql(self, mgmt_rule: Dict[str, Any], child_device_id: int) -> Optional[Dict[str, Any]]:
+        """
+        Find a matching rule on the child device using SIQL query.
+
+        Args:
+            mgmt_rule: Rule from management station
+            child_device_id: Child device ID to search
+
+        Returns:
+            Matching child rule or None
+        """
+        # Build SIQL query to match the management station rule
+        # Note: Due to FireMon bug, we can't use device ID and policy.name in same query
+        # So we use policy stanza separately and filter by child device ID after
+
+        rule_name = mgmt_rule.get('ruleName', '')
+        if not rule_name:
+            logging.debug("Management rule has no ruleName, cannot search by SIQL")
+            return None
+
+        # Escape single quotes in rule name for SIQL
+        escaped_name = rule_name.replace("'", "\\'")
+
+        # Build the query components - start with rule stanza
+        # All rule filters (name, action, zones) must be in the same stanza
+        rule_conditions = [f"ruleName='{escaped_name}'"]
+
+        # Add action filter (action field is supported)
+        if mgmt_rule.get('ruleAction'):
+            rule_conditions.append(f"action='{mgmt_rule['ruleAction']}'")
+
+        # Add zone filters to rule stanza
+        src_zones = mgmt_rule.get('srcContext', {}).get('zones', [])
+        dst_zones = mgmt_rule.get('dstContext', {}).get('zones', [])
+
+        # Build source zone filter (OR conditions for multiple zones)
+        src_zone_names = [z.get('displayName', z.get('name', '')) for z in src_zones
+                         if z.get('type') != 'ANY' and (z.get('displayName') or z.get('name'))]
+        if src_zone_names:
+            if len(src_zone_names) == 1:
+                escaped_zone = src_zone_names[0].replace("'", "\\'")
+                rule_conditions.append(f"(source.zone = '{escaped_zone}')")
+            else:
+                # Multiple zones - use OR
+                zone_conditions = [f"source.zone = '{z.replace(chr(39), chr(92)+chr(39))}'" for z in src_zone_names]
+                rule_conditions.append(f"({' OR '.join(zone_conditions)})")
+
+        # Build destination zone filter (OR conditions for multiple zones)
+        dst_zone_names = [z.get('displayName', z.get('name', '')) for z in dst_zones
+                         if z.get('type') != 'ANY' and (z.get('displayName') or z.get('name'))]
+        if dst_zone_names:
+            if len(dst_zone_names) == 1:
+                escaped_zone = dst_zone_names[0].replace("'", "\\'")
+                rule_conditions.append(f"(destination.zone = '{escaped_zone}')")
+            else:
+                # Multiple zones - use OR
+                zone_conditions = [f"destination.zone = '{z.replace(chr(39), chr(92)+chr(39))}'" for z in dst_zone_names]
+                rule_conditions.append(f"({' OR '.join(zone_conditions)})")
+
+        # Build complete rule stanza
+        query_parts = [f"rule {{ {' AND '.join(rule_conditions)} }}"]
+
+        # Add policy stanza separately (can't be combined with device ID due to FireMon bug)
+        policy_name = mgmt_rule.get('policy', {}).get('name')
+        if policy_name:
+            escaped_policy = policy_name.replace("'", "\\'")
+            query_parts.append(f" AND policy {{ displayName = '{escaped_policy}' }}")
+
+        # Add fields to retrieve props
+        query_parts.append(" | fields(props)")
+
+        query = "".join(query_parts)
+
+        logging.debug(f"SIQL query for rule matching: {query}")
+
+        try:
+            results = self.client.search_rules(query)
+
+            if not results:
+                logging.debug(f"No SIQL match found for rule '{rule_name}'")
+                return None
+
+            # Filter results by child device ID (since we can't include it in the query)
+            # Note: Device ID is in ndDevice.id, not deviceId
+            filtered_results = [r for r in results if r.get('ndDevice', {}).get('id') == child_device_id]
+
+            if not filtered_results:
+                logging.debug(f"Found rules with name '{rule_name}' but none on device {child_device_id}")
+                return None
+
+            if len(filtered_results) > 1:
+                logging.warning(f"Multiple SIQL matches found for rule '{rule_name}' on device {child_device_id}, using first match")
+
+            return filtered_results[0]
+
+        except Exception as e:
+            logging.debug(f"SIQL search failed for rule '{rule_name}': {e}")
+            return None
     
     def sync_management_station(self, mgmt_station: Dict[str, Any]) -> Dict[str, int]:
         """Sync rules from a management station to its child devices."""
         mgmt_id = mgmt_station['id']
-        mgmt_name = mgmt_station['name']
-        
+
+        # Fetch full device details to get the actual device name
+        try:
+            device_details = self.client.get_device(self.config['domain_id'], mgmt_id)
+            # Try to get the best name available
+            mgmt_name = device_details.get('description') or device_details.get('name') or f"Management Station {mgmt_id}"
+        except Exception as e:
+            logging.debug(f"Could not fetch device details for ID {mgmt_id}: {e}")
+            mgmt_name = mgmt_station.get('name', f"Management Station {mgmt_id}")
+
         logging.info("="*80)
         logging.info(f"Syncing Management Station: {mgmt_name} (ID: {mgmt_id})")
         logging.info("="*80)
@@ -931,19 +1212,16 @@ class RuleDocSyncer:
             'rules_no_match': 0
         }
         
-        # Get management station rules
+        # Get management station rules (includes rules with props and without)
         mgmt_rules = self.get_rules_with_props(mgmt_id, mgmt_name)
         if not mgmt_rules:
             logging.warning(f"No rules found on management station {mgmt_name}")
             return stats
-        
-        # Filter to only rules with props
-        mgmt_rules_with_props = [r for r in mgmt_rules if r.get('props')]
-        if not mgmt_rules_with_props:
-            logging.warning(f"No rules with custom properties found on management station {mgmt_name}")
-            return stats
-        
-        logging.info(f"Processing {len(mgmt_rules_with_props)} management station rules with props")
+
+        # Note: We process all rules (even those without props on mgmt station)
+        # because child devices might have props that need to be cleared
+        # The sync_single_rule method will check if sync is needed
+        logging.info(f"Processing {len(mgmt_rules)} management station rules")
         
         # Get child devices
         child_devices = self.get_child_devices(mgmt_id)
@@ -955,7 +1233,7 @@ class RuleDocSyncer:
         
         # Process each child device
         for child_device in child_devices:
-            child_stats = self.sync_child_device(mgmt_rules_with_props, child_device)
+            child_stats = self.sync_child_device(mgmt_rules, child_device)
             stats['rules_matched'] += child_stats['matched']
             stats['rules_updated'] += child_stats['updated']
             stats['rules_failed'] += child_stats['failed']
@@ -963,96 +1241,185 @@ class RuleDocSyncer:
         
         return stats
     
-    def sync_child_device(self, mgmt_rules: List[Dict[str, Any]], 
+    def sync_child_device(self, mgmt_rules: List[Dict[str, Any]],
                          child_device: Dict[str, Any]) -> Dict[str, int]:
         """Sync rules from management station to a single child device."""
         child_id = child_device['id']
         child_name = child_device['name']
-        
+
         logging.info(f"\nSyncing to child device: {child_name} (ID: {child_id})")
-        
+
         stats = {
             'matched': 0,
             'updated': 0,
             'failed': 0,
             'no_match': 0
         }
-        
-        # Get child device rules
+
+        # Fetch ALL child device rules once (much more efficient than per-rule queries)
+        logging.debug(f"Fetching all rules for child device {child_id}")
         child_rules = self.get_rules_with_props(child_id, child_name)
+
         if not child_rules:
             logging.warning(f"No rules found on child device {child_name}")
             return stats
-        
-        # Match rules between management station and child device
-        matches = self.matcher.match_rules(mgmt_rules, child_rules)
-        stats['matched'] = len(matches)
-        
-        logging.info(f"Matched {len(matches)} rules between management station and child device")
-        
-        # Sync props for each matched rule
-        for mgmt_rule, child_rule in matches:
-            if self.sync_single_rule(mgmt_rule, child_rule, child_id, child_name):
-                stats['updated'] += 1
+
+        logging.debug(f"Found {len(child_rules)} rules on child device")
+
+        # Build lookup dict for fast matching using composite key
+        # Key includes: rule_name, policy_name, action, source_zones, dest_zones, services
+        child_rules_lookup = {}
+        for child_rule in child_rules:
+            key = self._create_rule_match_key(child_rule)
+            # If duplicate keys exist, log warning but keep first match
+            if key in child_rules_lookup:
+                rule_name = child_rule.get('displayName', '')
+                policy_name = child_rule.get('policy', {}).get('displayName', '')
+                logging.warning(f"Duplicate rule found on child: '{rule_name}' in policy '{policy_name}'")
             else:
-                stats['failed'] += 1
-        
-        # Count unmatched management rules for this device
-        matched_mgmt_ids = {mgmt_rule['matchId'] for mgmt_rule, _ in matches}
-        stats['no_match'] = len(mgmt_rules) - len(matched_mgmt_ids)
-        
-        if stats['no_match'] > 0:
-            logging.info(f"{stats['no_match']} management station rules had no match on child device")
-        
+                child_rules_lookup[key] = child_rule
+
+        # Match management rules to child rules
+        for mgmt_rule in mgmt_rules:
+            mgmt_rule_name = mgmt_rule.get('displayName', '')
+            mgmt_policy_name = mgmt_rule.get('policy', {}).get('displayName', '')
+
+            if not mgmt_rule_name or not mgmt_policy_name:
+                logging.debug(f"Skipping rule without name or policy")
+                continue
+
+            # Look up matching child rule using composite key
+            key = self._create_rule_match_key(mgmt_rule)
+            child_rule = child_rules_lookup.get(key)
+
+            if child_rule:
+                stats['matched'] += 1
+                if self.sync_single_rule(mgmt_rule, child_rule, child_id, child_name):
+                    stats['updated'] += 1
+                else:
+                    stats['failed'] += 1
+            else:
+                stats['no_match'] += 1
+                logging.debug(f"No match found for management rule: '{mgmt_rule_name}' in policy '{mgmt_policy_name}'")
+
+        logging.info(f"Matched {stats['matched']} rules, updated {stats['updated']}, failed {stats['failed']}, no match {stats['no_match']}")
+
         return stats
     
     def sync_single_rule(self, mgmt_rule: Dict[str, Any], child_rule: Dict[str, Any],
                         child_device_id: int, child_device_name: str) -> bool:
         """Sync props from a management station rule to a child device rule."""
-        mgmt_props_raw = mgmt_rule.get('props')
-        child_props_raw = child_rule.get('props')
+
+        # Get the management station device ID from the rule
+        mgmt_device_id = mgmt_rule.get('ndDevice', {}).get('id')
+
+        # Fetch ACTUAL current props from ruledoc API (not cached SIQL data)
+        # This ensures we're comparing current state, not stale SIQL cache
+        try:
+            mgmt_ruledoc = self.client.get_rule_doc(
+                self.config['domain_id'],
+                mgmt_device_id,
+                mgmt_rule['matchId']
+            )
+            mgmt_props_raw = mgmt_ruledoc.get('props')
+        except Exception as e:
+            logging.warning(f"Could not fetch mgmt station ruledoc, using SIQL data: {e}")
+            mgmt_props_raw = mgmt_rule.get('props')
+
+        try:
+            child_ruledoc = self.client.get_rule_doc(
+                self.config['domain_id'],
+                child_device_id,
+                child_rule['matchId']
+            )
+            child_props_raw = child_ruledoc.get('props')
+        except Exception as e:
+            logging.warning(f"Could not fetch child ruledoc, using SIQL data: {e}")
+            child_props_raw = child_rule.get('props')
+
+        # Quick check: if both have no props (empty list or None), skip
+        if not mgmt_props_raw and not child_props_raw:
+            logging.debug(f"Both management and child have no props, skipping '{child_rule.get('displayName')}'")
+            return True
 
         # Convert management station props to list format
         if not mgmt_props_raw:
-            # Management station has no props - set to empty list to clear child props
-            mgmt_props = []
+            # Management station has no props - need to clear all child props
+            # We'll handle this by creating a merged list with all props cleared
+            mgmt_props_dict = {}
         elif isinstance(mgmt_props_raw, dict):
             logging.debug(f"Converting props dict to list format for rule '{child_rule.get('displayName')}'")
-            mgmt_props = self._convert_props_dict_to_list(mgmt_props_raw, child_rule['matchId'])
+            mgmt_props_dict = mgmt_props_raw
         elif isinstance(mgmt_props_raw, list):
-            # Props are already in list format, but need to update ruleId to child rule ID
-            # and fix date formatting
-            mgmt_props = []
+            # Convert list (from ruledoc API) to dict for easier merging
+            # Extract actual values from property objects
+            mgmt_props_dict = {}
             for prop in mgmt_props_raw:
-                updated_prop = prop.copy()
-                updated_prop['ruleId'] = child_rule['matchId']
-
-                # Fix date format if this is a DATE property
-                if 'dateval' in updated_prop and isinstance(updated_prop['dateval'], str):
-                    updated_prop['dateval'] = self._format_date_iso8601(updated_prop['dateval'])
-
-                mgmt_props.append(updated_prop)
+                # Get the key from the property definition
+                key = prop.get('ruleCustomPropertyDefinition', {}).get('key') or \
+                      prop.get('customProperty', {}).get('key')
+                if key:
+                    # Extract the actual value based on the value field present
+                    if 'stringval' in prop:
+                        mgmt_props_dict[key] = prop['stringval']
+                    elif 'stringarray' in prop:
+                        mgmt_props_dict[key] = prop['stringarray']
+                    elif 'integerval' in prop:
+                        mgmt_props_dict[key] = prop['integerval']
+                    elif 'booleanval' in prop:
+                        mgmt_props_dict[key] = prop['booleanval']
+                    elif 'dateval' in prop:
+                        mgmt_props_dict[key] = prop['dateval']
+                    elif 'usernameval' in prop:
+                        mgmt_props_dict[key] = prop['usernameval']
+                    # If no value field present, the property is cleared - don't add to dict
         else:
             logging.error(f"Props is not a dict or list: {type(mgmt_props_raw)}")
             return False
 
-        # For comparison, also convert child props if needed
+        # Get child props in list format for merging
         if isinstance(child_props_raw, dict):
-            child_props = self._convert_props_dict_to_list(child_props_raw, child_rule['matchId'])
+            child_props_list = self._convert_props_dict_to_list(child_props_raw, child_rule['matchId'])
         elif isinstance(child_props_raw, list):
-            # Also fix date formatting in child props for comparison
-            child_props = []
-            for prop in child_props_raw:
-                updated_prop = prop.copy()
-                updated_prop['ruleId'] = child_rule['matchId']
-
-                # Fix date format if this is a DATE property
-                if 'dateval' in updated_prop and isinstance(updated_prop['dateval'], str):
-                    updated_prop['dateval'] = self._format_date_iso8601(updated_prop['dateval'])
-
-                child_props.append(updated_prop)
+            child_props_list = child_props_raw
         else:
-            child_props = []
+            child_props_list = []
+
+        # Build the merged props list to send to API
+        # We need to send ALL properties that exist in the system, with values from mgmt station
+        mgmt_props = self._merge_props_for_sync(mgmt_props_dict, child_props_list, child_rule['matchId'])
+
+        # For comparison, convert child props to same format
+        if isinstance(child_props_raw, dict):
+            child_props_dict_for_compare = child_props_raw
+        elif isinstance(child_props_raw, list):
+            # Extract values from list format
+            child_props_dict_for_compare = {}
+            for prop in child_props_raw:
+                key = prop.get('ruleCustomPropertyDefinition', {}).get('key') or \
+                      prop.get('customProperty', {}).get('key')
+                if key:
+                    # Extract the actual value
+                    if 'stringval' in prop:
+                        child_props_dict_for_compare[key] = prop['stringval']
+                    elif 'stringarray' in prop:
+                        child_props_dict_for_compare[key] = prop['stringarray']
+                    elif 'integerval' in prop:
+                        child_props_dict_for_compare[key] = prop['integerval']
+                    elif 'booleanval' in prop:
+                        child_props_dict_for_compare[key] = prop['booleanval']
+                    elif 'dateval' in prop:
+                        child_props_dict_for_compare[key] = prop['dateval']
+                    elif 'usernameval' in prop:
+                        child_props_dict_for_compare[key] = prop['usernameval']
+        else:
+            child_props_dict_for_compare = {}
+
+        child_props = self._merge_props_for_sync(
+            child_props_dict_for_compare,
+            child_props_list,
+            child_rule['matchId']
+        )
 
         # Check if props are different
         if mgmt_props == child_props:
@@ -1130,7 +1497,7 @@ class RuleDocSyncer:
                 total_stats['rules_failed'] += stats['rules_failed']
                 total_stats['rules_no_match'] += stats['rules_no_match']
             
-            # Print summary to both console and log
+            # Print summary
             summary = [
                 "",
                 "="*80,
@@ -1145,11 +1512,7 @@ class RuleDocSyncer:
                 "="*80
             ]
 
-            # Print to console
-            for line in summary:
-                print(line)
-
-            # Also log it
+            # Log it (will appear in both console and file due to handlers)
             logging.info("\n".join(summary))
 
             return 0 if total_stats['rules_failed'] == 0 else 1
