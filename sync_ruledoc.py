@@ -432,35 +432,40 @@ class RuleMatcher:
         
         return matches
     
-    def _find_matching_rule(self, mgmt_rule: Dict[str, Any], 
+    def _find_matching_rule(self, mgmt_rule: Dict[str, Any],
                            child_rules: List[Dict[str, Any]],
                            matched_ids: Set[str]) -> Optional[Dict[str, Any]]:
         """
         Find a matching rule in child device rules.
-        
+
         Args:
             mgmt_rule: Rule from management station
             child_rules: List of rules from child device
             matched_ids: Set of already matched child rule IDs
-            
+
         Returns:
             Matching child rule or None
         """
+        mgmt_display = mgmt_rule.get('displayName', mgmt_rule.get('ruleName', 'Unknown'))
+
         for child_rule in child_rules:
             # Skip already matched rules
             if child_rule['matchId'] in matched_ids:
                 continue
-            
+
+            child_display = child_rule.get('displayName', child_rule.get('ruleName', 'Unknown'))
+            self.logger.debug(f"Comparing mgmt '{mgmt_display}' with child '{child_display}'")
+
             # Check if rules match
             if self._rules_match(mgmt_rule, child_rule):
                 return child_rule
-        
+
         return None
     
     def _rules_match(self, rule1: Dict[str, Any], rule2: Dict[str, Any]) -> bool:
         """
         Check if two rules match based on their definitions.
-        
+
         Rules match if they have the same:
         - Rule name
         - Policy name
@@ -469,56 +474,65 @@ class RuleMatcher:
         - Destinations
         - Services
         - Direction
-        
+
         Args:
             rule1: First rule to compare
             rule2: Second rule to compare
-            
+
         Returns:
             True if rules match, False otherwise
         """
         # Check rule name
         if not self._compare_strings(rule1.get('ruleName'), rule2.get('ruleName')):
+            self.logger.debug(f"  Rule name mismatch: '{rule1.get('ruleName')}' vs '{rule2.get('ruleName')}'")
             return False
-        
+
         # Check policy name
         policy1 = rule1.get('policy', {}).get('name', '')
         policy2 = rule2.get('policy', {}).get('name', '')
         if not self._compare_strings(policy1, policy2):
+            self.logger.debug(f"  Policy name mismatch: '{policy1}' vs '{policy2}'")
             return False
-        
+
         # Check rule action
         if rule1.get('ruleAction') != rule2.get('ruleAction'):
+            self.logger.debug(f"  Action mismatch: '{rule1.get('ruleAction')}' vs '{rule2.get('ruleAction')}'")
             return False
-        
+
         # Check direction
         if rule1.get('direction') != rule2.get('direction'):
+            self.logger.debug(f"  Direction mismatch: '{rule1.get('direction')}' vs '{rule2.get('direction')}'")
             return False
-        
+
         # Check sources
         if not self._compare_network_objects(rule1.get('sources', []), rule2.get('sources', [])):
+            self.logger.debug(f"  Source mismatch")
             return False
-        
+
         # Check destinations
         if not self._compare_network_objects(rule1.get('destinations', []), rule2.get('destinations', [])):
+            self.logger.debug(f"  Destination mismatch")
             return False
-        
+
         # Check services
         if not self._compare_service_objects(rule1.get('services', []), rule2.get('services', [])):
+            self.logger.debug(f"  Service mismatch")
             return False
-        
+
         # Check source zones
         src_zones1 = rule1.get('srcContext', {}).get('zones', [])
         src_zones2 = rule2.get('srcContext', {}).get('zones', [])
         if not self._compare_zones(src_zones1, src_zones2):
+            self.logger.debug(f"  Source zone mismatch")
             return False
-        
+
         # Check destination zones
         dst_zones1 = rule1.get('dstContext', {}).get('zones', [])
         dst_zones2 = rule2.get('dstContext', {}).get('zones', [])
         if not self._compare_zones(dst_zones1, dst_zones2):
+            self.logger.debug(f"  Destination zone mismatch")
             return False
-        
+
         return True
     
     def _compare_strings(self, str1: Optional[str], str2: Optional[str]) -> bool:
