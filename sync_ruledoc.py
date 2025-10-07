@@ -997,13 +997,11 @@ class RuleDocSyncer:
         mgmt_props_raw = mgmt_rule.get('props')
         child_props_raw = child_rule.get('props')
 
-        # Handle empty props
+        # Convert management station props to list format
         if not mgmt_props_raw:
-            logging.debug(f"No props to sync for rule '{child_rule.get('displayName')}'")
-            return True
-
-        # Convert props dict to list format if necessary
-        if isinstance(mgmt_props_raw, dict):
+            # Management station has no props - set to empty list to clear child props
+            mgmt_props = []
+        elif isinstance(mgmt_props_raw, dict):
             logging.debug(f"Converting props dict to list format for rule '{child_rule.get('displayName')}'")
             mgmt_props = self._convert_props_dict_to_list(mgmt_props_raw, child_rule['matchId'])
         elif isinstance(mgmt_props_raw, list):
@@ -1022,10 +1020,6 @@ class RuleDocSyncer:
         else:
             logging.error(f"Props is not a dict or list: {type(mgmt_props_raw)}")
             return False
-
-        if not mgmt_props:
-            logging.debug(f"No valid props after conversion for rule '{child_rule.get('displayName')}'")
-            return True
 
         # For comparison, also convert child props if needed
         if isinstance(child_props_raw, dict):
