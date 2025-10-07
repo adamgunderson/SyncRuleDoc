@@ -795,29 +795,36 @@ class RuleDocSyncer:
 
     def _format_date_iso8601(self, date_str: str) -> str:
         """
-        Convert a date string to ISO 8601 format with timezone.
+        Convert a date string to ISO 8601 format with timezone (no microseconds).
 
         Args:
-            date_str: Date string in various formats (e.g., "2022-03-12 00:00:00")
+            date_str: Date string in various formats (e.g., "2022-03-12 00:00:00" or "2025-09-09T17:50:54.191446")
 
         Returns:
             ISO 8601 formatted string (e.g., "2022-03-12T00:00:00-0700")
         """
         from datetime import datetime
         import time
+        import re
 
         try:
+            # Strip microseconds if present (e.g., ".191446")
+            date_str = re.sub(r'\.\d+', '', date_str)
+
             # Replace space with T if present
             if ' ' in date_str and 'T' not in date_str:
                 date_str = date_str.replace(' ', 'T')
+
+            # Strip any existing timezone info to parse the base datetime
+            clean_str = date_str
+            # Remove timezone patterns: +HHMM, -HHMM, +HH:MM, -HH:MM, Z
+            clean_str = re.sub(r'[+-]\d{2}:?\d{2}$', '', clean_str)
+            clean_str = clean_str.rstrip('Z')
 
             # Parse the date string - try common formats
             date_obj = None
             for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d']:
                 try:
-                    # Strip any existing timezone info
-                    clean_str = date_str.split('+')[0].split('-', 3)[0] if date_str.count('-') > 2 else date_str
-                    clean_str = clean_str.split('+')[0].split('Z')[0]
                     date_obj = datetime.strptime(clean_str, fmt)
                     break
                 except ValueError:
@@ -836,7 +843,7 @@ class RuleDocSyncer:
             offset_minutes = (abs(offset_sec) % 3600) // 60
             offset_sign = '+' if offset_sec >= 0 else '-'
 
-            # Format as YYYY-MM-DDTHH:mm:ss±HHMM
+            # Format as YYYY-MM-DDTHH:mm:ss±HHMM (no microseconds)
             formatted = date_obj.strftime('%Y-%m-%dT%H:%M:%S')
             formatted += f"{offset_sign}{abs(offset_hours):02d}{offset_minutes:02d}"
 
