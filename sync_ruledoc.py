@@ -753,6 +753,7 @@ class RuleDocSyncer:
             }
 
             # Set value based on type
+            # API field names: stringval, integerval, booleanval, dateval, stringarray, usernameval
             prop_type = prop_def['type']
             if prop_type == 'STRING':
                 prop_obj['stringval'] = str(value)
@@ -775,18 +776,18 @@ class RuleDocSyncer:
                 else:
                     prop_obj['stringarray'] = [str(value)]
             elif prop_type == 'INTEGER':
-                prop_obj['intval'] = int(value)
+                prop_obj['integerval'] = int(value)
             elif prop_type == 'LONG':
-                prop_obj['longval'] = int(value)
-            elif prop_type == 'DOUBLE':
-                prop_obj['doubleval'] = float(value)
+                prop_obj['integerval'] = int(value)  # LONG also uses integerval
             elif prop_type == 'BOOLEAN':
-                prop_obj['boolval'] = bool(value)
+                prop_obj['booleanval'] = bool(value)
             elif prop_type == 'DATE':
                 # The API expects ISO 8601 format: YYYY-MM-DDTHH:mm:ss±HHMM
                 # Example: "2025-10-10T00:00:00-0700"
                 prop_obj['dateval'] = self._format_date_iso8601(str(value))
             else:
+                # Unknown type - log warning and use string value
+                logging.warning(f"Unknown property type '{prop_type}' for key '{key}', using stringval")
                 prop_obj['stringval'] = str(value)
 
             props_list.append(prop_obj)
@@ -807,16 +808,16 @@ class RuleDocSyncer:
         import time
         import re
 
+        # If already in correct format, return as-is
+        if re.match(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$', date_str):
+            return date_str
+
         try:
             # Strip microseconds if present (e.g., ".191446")
-            date_str = re.sub(r'\.\d+', '', date_str)
-
-            # Replace space with T if present
-            if ' ' in date_str and 'T' not in date_str:
-                date_str = date_str.replace(' ', 'T')
+            working_str = re.sub(r'\.\d+', '', date_str)
 
             # Strip any existing timezone info to parse the base datetime
-            clean_str = date_str
+            clean_str = working_str
             # Remove timezone patterns: +HHMM, -HHMM, +HH:MM, -HH:MM, Z
             clean_str = re.sub(r'[+-]\d{2}:?\d{2}$', '', clean_str)
             clean_str = clean_str.rstrip('Z')
@@ -850,8 +851,8 @@ class RuleDocSyncer:
             return formatted
 
         except Exception as e:
-            logging.warning(f"Failed to parse date: {date_str}, using as-is. Error: {e}")
-            return date_str
+            logging.error(f"Failed to parse date: {date_str}, Error: {e}")
+            raise ValueError(f"Cannot format date '{date_str}' to ISO 8601 format")
 
     def get_management_stations(self) -> List[Dict[str, Any]]:
         """Get all management stations in the domain."""
