@@ -13,6 +13,10 @@ This script solves the problem of keeping rule documentation synchronized betwee
 - Syncs custom property values from management station rules to child device rules
 - Supports all custom property types (STRING, INTEGER, DATE, BOOLEAN, etc.)
 - Handles authentication with token refresh
+- **Interactive prompts** for credentials when environment variables are not set
+- **Parallel processing** with configurable worker threads for faster syncs
+- **Real-time progress indicator** during sync operations
+- **Smart skipping** of rules already in sync (compares props before updating)
 - Provides detailed logging and progress tracking
 - Can sync all management stations or target a specific one
 
@@ -32,10 +36,10 @@ This script solves the problem of keeping rule documentation synchronized betwee
 
 ## Configuration
 
-The script uses environment variables for configuration:
+The script uses environment variables for configuration. **If credentials are not set, the script will prompt you interactively.**
 
 ```bash
-# Required
+# Required (will be prompted if not set)
 export FIREMON_URL="https://your-firemon-server.com"
 export FIREMON_USER="your-username"
 export FIREMON_PASSWORD='your-password'
@@ -48,6 +52,7 @@ export FIREMON_LOG_LEVEL="INFO"                 # Default: INFO (options: DEBUG,
 export FIREMON_LOG_MAX_BYTES="10485760"         # Default: 10MB (log rotation size)
 export FIREMON_LOG_BACKUP_COUNT="5"             # Default: 5 (number of rotated logs to keep)
 export FIREMON_VERIFY_SSL="false"               # Default: false
+export FIREMON_WORKERS="5"                      # Default: 5 (parallel API workers)
 ```
 
 ## Usage
@@ -82,6 +87,18 @@ Get detailed logging output:
 
 ```bash
 python3.12 sync_ruledoc.py --debug
+```
+
+### Adjust Parallel Workers
+
+Control the number of parallel API workers (default: 5):
+
+```bash
+# Use 10 parallel workers for faster sync
+python3.12 sync_ruledoc.py --workers 10
+
+# Use fewer workers to reduce server load
+python3.12 sync_ruledoc.py --workers 2
 ```
 
 ### Running as a Cron Job
@@ -194,6 +211,7 @@ This ensures that only truly corresponding rules have their documentation synchr
 
 The script provides:
 
+- **Real-time progress indicator** during sync operations
 - Console output with progress and status messages
 - Detailed log file with automatic rotation (default: `sync_ruledoc.log`)
   - Rotates when log reaches 10MB (configurable)
@@ -204,21 +222,35 @@ The script provides:
   - Child devices processed
   - Rules matched
   - Rules updated
+  - Rules skipped (already in sync)
   - Rules failed
   - Rules with no match
 
 ### Example Output
 
 ```
+Syncing Management Station: KF FMC (ID: 195)
+Fetching management station rules...
+Found 4761 rules (4601 with props)
+Fetching child devices...
+Found 5 child device(s)
+Fetching rules for 5 child device(s) in parallel...
+Found 15000 rules across all child devices
+Built lookup index with 4500 unique rule keys
+Matched 4500 rules, 200 need updates, 4300 already in sync
+Syncing 200 rules using 5 parallel workers...
+Progress: 200/200 (100%) - Updated: 198, Failed: 2
+
 ================================================================================
 Sync Summary:
 ================================================================================
-Management stations processed: 3
-Child devices processed: 12
-Rules matched: 245
-Rules updated: 187
-Rules failed: 0
-Rules with no match: 58
+Management stations processed: 1
+Child devices processed: 5
+Rules matched: 4500
+Rules updated: 198
+Rules skipped (already in sync): 4300
+Rules failed: 2
+Rules with no match: 261
 ================================================================================
 ```
 
@@ -298,10 +330,17 @@ For issues or questions:
 
 ## Version History
 
+- **1.1**: Performance and usability improvements
+  - Interactive prompts for credentials when environment variables not set
+  - Parallel processing with configurable worker threads (`--workers`, `FIREMON_WORKERS`)
+  - Real-time progress indicator during sync operations
+  - Smart skipping of rules already in sync (10-50x faster for repeat syncs)
+  - Optimized batch fetching of child device rules
+
 - **1.0**: Initial release with core sync functionality
-- Support for all custom property types
-- Automatic rule matching between management stations and child devices
-- Progress tracking and detailed logging
+  - Support for all custom property types
+  - Automatic rule matching between management stations and child devices
+  - Progress tracking and detailed logging
 
 ## License
 

@@ -25,6 +25,8 @@ import json
 import logging
 import warnings
 import argparse
+import getpass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Any, Optional, Tuple, Set
 
@@ -98,17 +100,32 @@ def initialize_firemon_environment() -> bool:
 def load_config() -> Dict[str, Any]:
     """Load configuration with environment variable support for sensitive data."""
     return {
-        'url': os.environ.get('FIREMON_URL', 'https://demo.firemon.xyz'),
-        'user': os.environ.get('FIREMON_USER', 'username'),
-        'password': os.environ.get('FIREMON_PASSWORD', 'password'),
+        'url': os.environ.get('FIREMON_URL', ''),
+        'user': os.environ.get('FIREMON_USER', ''),
+        'password': os.environ.get('FIREMON_PASSWORD', ''),
         'page_size': int(os.environ.get('FIREMON_PAGE_SIZE', '100')),
         'log_filename': os.environ.get('FIREMON_LOG_FILE', './sync_ruledoc.log'),
         'log_level': getattr(logging, os.environ.get('FIREMON_LOG_LEVEL', 'INFO')),
         'log_max_bytes': int(os.environ.get('FIREMON_LOG_MAX_BYTES', '10485760')),  # 10MB default
         'log_backup_count': int(os.environ.get('FIREMON_LOG_BACKUP_COUNT', '5')),  # Keep 5 backups
         'domain_id': int(os.environ.get('FIREMON_DOMAIN_ID', '1')),
-        'verify_ssl': os.environ.get('FIREMON_VERIFY_SSL', 'false').lower() == 'true'
+        'verify_ssl': os.environ.get('FIREMON_VERIFY_SSL', 'false').lower() == 'true',
+        'workers': int(os.environ.get('FIREMON_WORKERS', '5'))
     }
+
+
+def prompt_for_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Prompt for missing configuration values interactively."""
+    if not config['url']:
+        config['url'] = input("FireMon URL (e.g., https://firemon.example.com): ").strip()
+
+    if not config['user']:
+        config['user'] = input("Username: ").strip()
+
+    if not config['password']:
+        config['password'] = getpass.getpass("Password: ")
+
+    return config
 
 
 def setup_logging(log_filename: str, log_level: int, max_bytes: int = 10485760, backup_count: int = 5) -> None:
@@ -1042,6 +1059,72 @@ class RuleDocSyncer:
             logging.error(f"Failed to parse date: {date_str}, Error: {e}")
             raise ValueError(f"Cannot format date '{date_str}' to ISO 8601 format")
 
+    def _normalize_props_to_dict(self, props: Any) -> Dict[str, Any]:
+        """
+        Normalize props (dict or list format) to a comparable dictionary.
+
+        Args:
+            props: Props in either dict format (from SIQL) or list format (from ruledoc API)
+
+        Returns:
+            Dictionary of {key: value} for comparison
+        """
+        if not props:
+            return {}
+
+        if isinstance(props, dict):
+            # Already in dict format from SIQL - filter out None values
+            return {k: v for k, v in props.items() if v is not None}
+
+        if isinstance(props, list):
+            # List format from ruledoc API - extract key/value pairs
+            result = {}
+            for prop in props:
+                key = prop.get('ruleCustomPropertyDefinition', {}).get('key') or \
+                      prop.get('customProperty', {}).get('key')
+                if not key:
+                    continue
+
+                # Extract value based on type
+                if 'stringval' in prop:
+                    result[key] = prop['stringval']
+                elif 'stringarray' in prop:
+                    result[key] = tuple(sorted(prop['stringarray'])) if prop['stringarray'] else ()
+                elif 'integerval' in prop:
+                    result[key] = prop['integerval']
+                elif 'booleanval' in prop:
+                    result[key] = prop['booleanval']
+                elif 'dateval' in prop:
+                    result[key] = prop['dateval']
+                elif 'usernameval' in prop:
+                    result[key] = prop['usernameval']
+                # If no value field, prop is cleared - don't add to result
+            return result
+
+        return {}
+
+    def _props_differ(self, props1: Any, props2: Any) -> bool:
+        """
+        Quick check if props are different (using SIQL data).
+
+        Args:
+            props1: Props from first rule (dict or list format)
+            props2: Props from second rule (dict or list format)
+
+        Returns:
+            True if props are different, False if same
+        """
+        norm1 = self._normalize_props_to_dict(props1)
+        norm2 = self._normalize_props_to_dict(props2)
+
+        # Handle string arrays - normalize for comparison
+        for d in [norm1, norm2]:
+            for k, v in list(d.items()):
+                if isinstance(v, list):
+                    d[k] = tuple(sorted(v))
+
+        return norm1 != norm2
+
     def get_management_stations(self) -> List[Dict[str, Any]]:
         """Get all management stations in the domain."""
         logging.info("Fetching management stations...")
@@ -1186,59 +1269,228 @@ class RuleDocSyncer:
         except Exception as e:
             logging.debug(f"SIQL search failed for rule '{rule_name}': {e}")
             return None
-    
+
+    def find_child_rules_for_mgmt_rule(self, mgmt_rule: Dict[str, Any],
+                                        mgmt_device_id: int) -> List[Dict[str, Any]]:
+        """
+        Find all child device rules that match a management station rule using policyRules.
+
+        Uses the policyRules array from the management station rule to efficiently
+        find matching rules on child devices, then applies strict attribute matching.
+
+        Args:
+            mgmt_rule: Rule from management station (must include policyRules)
+            mgmt_device_id: Management station device ID to exclude from results
+
+        Returns:
+            List of matching child device rules
+        """
+        rule_name = mgmt_rule.get('ruleName', '')
+        policy_rules = mgmt_rule.get('policyRules', [])
+
+        if not rule_name:
+            logging.debug("Management rule has no ruleName, cannot find child rules")
+            return []
+
+        if not policy_rules:
+            logging.debug(f"Management rule '{rule_name}' has no policyRules array")
+            return []
+
+        child_rules = []
+        seen_match_ids = set()  # Avoid duplicates
+
+        for policy_ref in policy_rules:
+            policy_name = policy_ref.get('policy', {}).get('displayName', '')
+            if not policy_name:
+                continue
+
+            # Escape single quotes for SIQL
+            escaped_rule = rule_name.replace("'", "\\'")
+            escaped_policy = policy_name.replace("'", "\\'")
+
+            # Query for candidate rules with this policy and rule name
+            query = f"rule {{ ruleName = '{escaped_rule}' }} AND policy {{ displayName = '{escaped_policy}' }} | fields(props)"
+
+            try:
+                candidates = self.client.search_rules(query)
+            except Exception as e:
+                logging.debug(f"SIQL search failed for rule '{rule_name}' in policy '{policy_name}': {e}")
+                continue
+
+            # Filter: exclude management station + apply strict attribute matching
+            for candidate in candidates:
+                candidate_device_id = candidate.get('ndDevice', {}).get('id')
+                candidate_match_id = candidate.get('matchId')
+
+                # Skip management station rules
+                if candidate_device_id == mgmt_device_id:
+                    continue
+
+                # Skip already found rules (avoid duplicates)
+                if candidate_match_id in seen_match_ids:
+                    continue
+
+                # Apply strict attribute matching using the RuleMatcher
+                if self.matcher._rules_match(mgmt_rule, candidate):
+                    child_rules.append(candidate)
+                    seen_match_ids.add(candidate_match_id)
+                    logging.debug(f"Matched child rule: '{rule_name}' on device {candidate_device_id}")
+
+        logging.debug(f"Found {len(child_rules)} child rules for management rule '{rule_name}'")
+        return child_rules
+
     def sync_management_station(self, mgmt_station: Dict[str, Any]) -> Dict[str, int]:
-        """Sync rules from a management station to its child devices."""
+        """
+        Optimized sync of rules from management station to child devices.
+
+        Key optimizations:
+        1. Fetches ALL child rules in ONE SIQL query (not per-rule)
+        2. Builds lookup dictionaries for O(1) matching
+        3. Compares SIQL props first to skip unchanged rules
+        4. Uses parallel workers for updates with progress display
+        """
         mgmt_id = mgmt_station['id']
 
         # Fetch full device details to get the actual device name
         try:
             device_details = self.client.get_device(self.config['domain_id'], mgmt_id)
-            # Try to get the best name available
             mgmt_name = device_details.get('description') or device_details.get('name') or f"Management Station {mgmt_id}"
         except Exception as e:
             logging.debug(f"Could not fetch device details for ID {mgmt_id}: {e}")
             mgmt_name = mgmt_station.get('name', f"Management Station {mgmt_id}")
 
-        logging.info("="*80)
+        logging.info("=" * 80)
         logging.info(f"Syncing Management Station: {mgmt_name} (ID: {mgmt_id})")
-        logging.info("="*80)
-        
+        logging.info("=" * 80)
+
         stats = {
             'child_devices': 0,
             'rules_matched': 0,
             'rules_updated': 0,
+            'rules_skipped': 0,
             'rules_failed': 0,
             'rules_no_match': 0
         }
-        
-        # Get management station rules (includes rules with props and without)
+
+        # Step 1: Fetch ALL management station rules
+        logging.info("Fetching management station rules...")
         mgmt_rules = self.get_rules_with_props(mgmt_id, mgmt_name)
         if not mgmt_rules:
             logging.warning(f"No rules found on management station {mgmt_name}")
             return stats
 
-        # Note: We process all rules (even those without props on mgmt station)
-        # because child devices might have props that need to be cleared
-        # The sync_single_rule method will check if sync is needed
-        logging.info(f"Processing {len(mgmt_rules)} management station rules")
-        
-        # Get child devices
+        rules_with_props = [r for r in mgmt_rules if r.get('props')]
+        logging.info(f"Found {len(mgmt_rules)} rules ({len(rules_with_props)} with props)")
+
+        # Step 2: Get child devices, then fetch their rules in parallel
+        logging.info("Fetching child devices...")
         child_devices = self.get_child_devices(mgmt_id)
         if not child_devices:
-            logging.warning(f"No child devices found for management station {mgmt_name}")
+            logging.warning("No child devices found for management station")
             return stats
-        
+
+        # Fetch rules for all child devices in parallel
+        logging.info(f"Fetching rules for {len(child_devices)} child device(s) in parallel...")
+        all_child_rules = []
+        workers = self.config.get('workers', 5)
+
+        def fetch_device_rules(device):
+            """Fetch rules for a single device."""
+            device_id = device['id']
+            device_name = device.get('name', f'Device {device_id}')
+            query = f"device{{id={device_id}}} | fields(props)"
+            try:
+                return self.client.search_rules(query)
+            except Exception as e:
+                logging.error(f"Failed to fetch rules for device {device_name}: {e}")
+                return []
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(fetch_device_rules, dev): dev for dev in child_devices}
+            for future in as_completed(futures):
+                rules = future.result()
+                all_child_rules.extend(rules)
+
+        logging.info(f"Found {len(all_child_rules)} rules across all child devices")
+
+        # Step 3: Build lookup dictionary by composite key
+        # Key = (ruleName, policyName, action, src_zones, dst_zones, services)
+        child_rules_by_key = {}
+        for rule in all_child_rules:
+            key = self._create_rule_match_key(rule)
+            child_rules_by_key.setdefault(key, []).append(rule)
+
         stats['child_devices'] = len(child_devices)
-        
-        # Process each child device
-        for child_device in child_devices:
-            child_stats = self.sync_child_device(mgmt_rules, child_device)
-            stats['rules_matched'] += child_stats['matched']
-            stats['rules_updated'] += child_stats['updated']
-            stats['rules_failed'] += child_stats['failed']
-            stats['rules_no_match'] += child_stats['no_match']
-        
+        logging.info(f"Built lookup index with {len(child_rules_by_key)} unique rule keys")
+
+        # Step 4: Match and filter - identify rules needing update
+        updates_needed = []
+        for mgmt_rule in mgmt_rules:
+            key = self._create_rule_match_key(mgmt_rule)
+            matched_child_rules = child_rules_by_key.get(key, [])
+
+            if not matched_child_rules:
+                stats['rules_no_match'] += 1
+                continue
+
+            stats['rules_matched'] += len(matched_child_rules)
+
+            for child_rule in matched_child_rules:
+                # Compare SIQL props first - skip if already in sync
+                if not self._props_differ(mgmt_rule.get('props'), child_rule.get('props')):
+                    stats['rules_skipped'] += 1
+                    continue
+
+                updates_needed.append((mgmt_rule, child_rule))
+
+        logging.info(f"Matched {stats['rules_matched']} rules, {len(updates_needed)} need updates, {stats['rules_skipped']} already in sync")
+
+        if not updates_needed:
+            logging.info("All rules already in sync - no updates needed")
+            return stats
+
+        # Step 5: Parallel updates with progress indicator
+        workers = self.config.get('workers', 5)
+        total = len(updates_needed)
+        completed = 0
+        updated = 0
+        failed = 0
+
+        logging.info(f"Syncing {total} rules using {workers} parallel workers...")
+
+        def sync_rule_wrapper(args):
+            """Wrapper to sync a single rule and return result."""
+            mgmt_rule, child_rule = args
+            child_device_id = child_rule.get('ndDevice', {}).get('id')
+            child_device_name = child_rule.get('ndDevice', {}).get('name', f'Device {child_device_id}')
+            try:
+                return self.sync_single_rule(mgmt_rule, child_rule, child_device_id, child_device_name)
+            except Exception as e:
+                logging.error(f"Error syncing rule: {e}")
+                return False
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(sync_rule_wrapper, args): args for args in updates_needed}
+
+            for future in as_completed(futures):
+                completed += 1
+                result = future.result()
+                if result:
+                    updated += 1
+                else:
+                    failed += 1
+
+                # Progress indicator (overwrite line)
+                pct = 100 * completed // total
+                print(f"\rProgress: {completed}/{total} ({pct}%) - Updated: {updated}, Failed: {failed}", end='', flush=True)
+
+        print()  # Newline after progress
+
+        stats['rules_updated'] = updated
+        stats['rules_failed'] = failed
+
+        logging.info(f"Sync complete: {updated} updated, {failed} failed, {stats['rules_skipped']} skipped (already in sync)")
+
         return stats
     
     def sync_child_device(self, mgmt_rules: List[Dict[str, Any]],
@@ -1485,31 +1737,34 @@ class RuleDocSyncer:
                 'child_devices': 0,
                 'rules_matched': 0,
                 'rules_updated': 0,
+                'rules_skipped': 0,
                 'rules_failed': 0,
                 'rules_no_match': 0
             }
-            
+
             for mgmt_station in mgmt_stations:
                 stats = self.sync_management_station(mgmt_station)
                 total_stats['child_devices'] += stats['child_devices']
                 total_stats['rules_matched'] += stats['rules_matched']
                 total_stats['rules_updated'] += stats['rules_updated']
+                total_stats['rules_skipped'] += stats.get('rules_skipped', 0)
                 total_stats['rules_failed'] += stats['rules_failed']
                 total_stats['rules_no_match'] += stats['rules_no_match']
-            
+
             # Print summary
             summary = [
                 "",
-                "="*80,
+                "=" * 80,
                 "Sync Summary:",
-                "="*80,
+                "=" * 80,
                 f"Management stations processed: {total_stats['mgmt_stations']}",
                 f"Child devices processed: {total_stats['child_devices']}",
                 f"Rules matched: {total_stats['rules_matched']}",
                 f"Rules updated: {total_stats['rules_updated']}",
+                f"Rules skipped (already in sync): {total_stats['rules_skipped']}",
                 f"Rules failed: {total_stats['rules_failed']}",
                 f"Rules with no match: {total_stats['rules_no_match']}",
-                "="*80
+                "=" * 80
             ]
 
             # Log it (will appear in both console and file due to handlers)
@@ -1583,14 +1838,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Environment Variables:
-  FIREMON_URL          FireMon server URL
-  FIREMON_USER         Username
-  FIREMON_PASSWORD     Password
+  FIREMON_URL          FireMon server URL (prompted if not set)
+  FIREMON_USER         Username (prompted if not set)
+  FIREMON_PASSWORD     Password (prompted if not set)
   FIREMON_DOMAIN_ID    Domain ID (default: 1)
-  FIREMON_LOG_FILE     Log file path (default: ./sync_ruledoc_log.txt)
+  FIREMON_LOG_FILE     Log file path (default: ./sync_ruledoc.log)
   FIREMON_LOG_LEVEL    Log level (DEBUG, INFO, WARNING, ERROR)
   FIREMON_PAGE_SIZE    API page size (default: 100)
   FIREMON_VERIFY_SSL   Verify SSL certificates (true/false, default: false)
+  FIREMON_WORKERS      Number of parallel API workers (default: 5)
 
 Examples:
   # Test connection
@@ -1621,20 +1877,33 @@ Examples:
         action='store_true',
         help='Enable debug logging'
     )
-    
+
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=None,
+        help='Number of parallel workers for API calls (default: 5)'
+    )
+
     args = parser.parse_args()
-    
+
     # Initialize FireMon environment
     print("Initializing FireMon environment...")
     if not initialize_firemon_environment():
         sys.exit(1)
-    
+
     # Load configuration
     config = load_config()
-    
+
+    # Prompt for missing credentials
+    config = prompt_for_config(config)
+
     if args.debug:
         config['log_level'] = logging.DEBUG
-    
+
+    if args.workers is not None:
+        config['workers'] = args.workers
+
     if args.test:
         success = test_connection(config)
         sys.exit(0 if success else 1)
