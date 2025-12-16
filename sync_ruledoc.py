@@ -1142,7 +1142,7 @@ class RuleDocSyncer:
         """Get child devices for a management station, optionally filtered by device group."""
         if device_group_id:
             logging.info(f"Fetching child devices in group {device_group_id} for management station {mgmt_station_id}...")
-            query = f"device{{managementstationid={mgmt_station_id} AND devicegroupid={device_group_id}}}"
+            query = f"device{{managementstationid={mgmt_station_id}}} AND devicegroup{{id={device_group_id}}}"
         else:
             logging.info(f"Fetching child devices for management station {mgmt_station_id}...")
             query = f"device{{managementstationid={mgmt_station_id}}}"
