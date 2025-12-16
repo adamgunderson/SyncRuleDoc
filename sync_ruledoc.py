@@ -1138,17 +1138,21 @@ class RuleDocSyncer:
         
         return mgmt_stations
     
-    def get_child_devices(self, mgmt_station_id: int) -> List[Dict[str, Any]]:
-        """Get all child devices for a management station."""
-        logging.info(f"Fetching child devices for management station {mgmt_station_id}...")
-        
-        query = f"device{{managementstationid={mgmt_station_id}}}"
+    def get_child_devices(self, mgmt_station_id: int, device_group_id: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Get child devices for a management station, optionally filtered by device group."""
+        if device_group_id:
+            logging.info(f"Fetching child devices in group {device_group_id} for management station {mgmt_station_id}...")
+            query = f"device{{managementstationid={mgmt_station_id} AND devicegroupid={device_group_id}}}"
+        else:
+            logging.info(f"Fetching child devices for management station {mgmt_station_id}...")
+            query = f"device{{managementstationid={mgmt_station_id}}}"
+
         child_devices = self.client.search_devices(query)
-        
+
         logging.info(f"Found {len(child_devices)} child device(s)")
         for device in child_devices:
             logging.info(f"  - {device['name']} (ID: {device['id']}, Type: {device.get('deviceType', 'Unknown')})")
-        
+
         return child_devices
     
     def get_rules_with_props(self, device_id: int, device_name: str) -> List[Dict[str, Any]]:
@@ -1339,7 +1343,7 @@ class RuleDocSyncer:
         logging.debug(f"Found {len(child_rules)} child rules for management rule '{rule_name}'")
         return child_rules
 
-    def sync_management_station(self, mgmt_station: Dict[str, Any]) -> Dict[str, int]:
+    def sync_management_station(self, mgmt_station: Dict[str, Any], device_group_id: Optional[int] = None) -> Dict[str, int]:
         """
         Optimized sync of rules from management station to child devices.
 
@@ -1348,6 +1352,10 @@ class RuleDocSyncer:
         2. Builds lookup dictionaries for O(1) matching
         3. Compares SIQL props first to skip unchanged rules
         4. Uses parallel workers for updates with progress display
+
+        Args:
+            mgmt_station: Management station dict with 'id' key
+            device_group_id: Optional device group ID to filter child devices
         """
         mgmt_id = mgmt_station['id']
 
@@ -1383,8 +1391,7 @@ class RuleDocSyncer:
         logging.info(f"Found {len(mgmt_rules)} rules ({len(rules_with_props)} with props)")
 
         # Step 2: Get child devices, then fetch their rules in parallel
-        logging.info("Fetching child devices...")
-        child_devices = self.get_child_devices(mgmt_id)
+        child_devices = self.get_child_devices(mgmt_id, device_group_id)
         if not child_devices:
             logging.warning("No child devices found for management station")
             return stats
@@ -1492,7 +1499,292 @@ class RuleDocSyncer:
         logging.info(f"Sync complete: {updated} updated, {failed} failed, {stats['rules_skipped']} skipped (already in sync)")
 
         return stats
-    
+
+    def sync_management_station_reverse(self, mgmt_station: Dict[str, Any], device_group_id: Optional[int] = None) -> Dict[str, int]:
+        """
+        Reverse sync: copy props FROM child devices TO management station.
+
+        Key differences from forward sync:
+        - Source = child device rules (with props)
+        - Target = management station rules
+        - First match wins when multiple children have props for same rule
+
+        Args:
+            mgmt_station: Management station dict with 'id' key
+            device_group_id: Optional device group ID to filter child devices
+        """
+        mgmt_id = mgmt_station['id']
+
+        # Fetch full device details to get the actual device name
+        try:
+            device_details = self.client.get_device(self.config['domain_id'], mgmt_id)
+            mgmt_name = device_details.get('description') or device_details.get('name') or f"Management Station {mgmt_id}"
+        except Exception as e:
+            logging.debug(f"Could not fetch device details for ID {mgmt_id}: {e}")
+            mgmt_name = mgmt_station.get('name', f"Management Station {mgmt_id}")
+
+        logging.info("=" * 80)
+        logging.info(f"REVERSE SYNC: {mgmt_name} (ID: {mgmt_id}) [Child → Mgmt]")
+        logging.info("=" * 80)
+
+        stats = {
+            'child_devices': 0,
+            'rules_matched': 0,
+            'rules_updated': 0,
+            'rules_skipped': 0,
+            'rules_failed': 0,
+            'rules_no_match': 0
+        }
+
+        # Step 1: Fetch management station rules (these are the TARGETS)
+        logging.info("Fetching management station rules (targets)...")
+        mgmt_rules = self.get_rules_with_props(mgmt_id, mgmt_name)
+        if not mgmt_rules:
+            logging.warning(f"No rules found on management station {mgmt_name}")
+            return stats
+
+        logging.info(f"Found {len(mgmt_rules)} rules on management station")
+
+        # Step 2: Get child devices, then fetch their rules in parallel
+        child_devices = self.get_child_devices(mgmt_id, device_group_id)
+        if not child_devices:
+            logging.warning("No child devices found for management station")
+            return stats
+
+        # Fetch rules for all child devices in parallel
+        logging.info(f"Fetching rules for {len(child_devices)} child device(s) in parallel...")
+        all_child_rules = []
+        workers = self.config.get('workers', 5)
+
+        def fetch_device_rules(device):
+            """Fetch rules for a single device."""
+            device_id = device['id']
+            device_name = device.get('name', f'Device {device_id}')
+            query = f"device{{id={device_id}}} | fields(props)"
+            try:
+                return self.client.search_rules(query)
+            except Exception as e:
+                logging.error(f"Failed to fetch rules for device {device_name}: {e}")
+                return []
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(fetch_device_rules, dev): dev for dev in child_devices}
+            for future in as_completed(futures):
+                rules = future.result()
+                all_child_rules.extend(rules)
+
+        stats['child_devices'] = len(child_devices)
+
+        # Filter to only child rules that have props (these are the SOURCES)
+        child_rules_with_props = [r for r in all_child_rules if r.get('props')]
+        logging.info(f"Found {len(all_child_rules)} rules across all child devices ({len(child_rules_with_props)} with props)")
+
+        if not child_rules_with_props:
+            logging.warning("No child rules with props found - nothing to sync")
+            return stats
+
+        # Step 3: Build lookup dictionary of MGMT rules by composite key
+        mgmt_rules_by_key = {}
+        for rule in mgmt_rules:
+            key = self._create_rule_match_key(rule)
+            mgmt_rules_by_key.setdefault(key, []).append(rule)
+
+        logging.info(f"Built lookup index with {len(mgmt_rules_by_key)} unique mgmt rule keys")
+
+        # Step 4: Match and filter - identify rules needing update
+        # Track which mgmt rules have been matched (first match wins)
+        updates_needed = []
+        mgmt_rules_updated = set()  # Track matchIds already scheduled for update
+
+        for child_rule in child_rules_with_props:
+            key = self._create_rule_match_key(child_rule)
+            matched_mgmt_rules = mgmt_rules_by_key.get(key, [])
+
+            if not matched_mgmt_rules:
+                stats['rules_no_match'] += 1
+                continue
+
+            # Find a mgmt rule that hasn't been updated yet (first match wins)
+            mgmt_rule = None
+            for candidate in matched_mgmt_rules:
+                if candidate['matchId'] not in mgmt_rules_updated:
+                    mgmt_rule = candidate
+                    break
+
+            if not mgmt_rule:
+                # All matching mgmt rules already have updates scheduled
+                stats['rules_skipped'] += 1
+                continue
+
+            stats['rules_matched'] += 1
+
+            # Compare SIQL props first - skip if already in sync
+            if not self._props_differ(child_rule.get('props'), mgmt_rule.get('props')):
+                stats['rules_skipped'] += 1
+                continue
+
+            updates_needed.append((child_rule, mgmt_rule))
+            mgmt_rules_updated.add(mgmt_rule['matchId'])
+
+        logging.info(f"Matched {stats['rules_matched']} rules, {len(updates_needed)} need updates, {stats['rules_skipped']} already in sync")
+
+        if not updates_needed:
+            logging.info("All rules already in sync - no updates needed")
+            return stats
+
+        # Step 5: Parallel updates with progress indicator
+        total = len(updates_needed)
+        completed = 0
+        updated = 0
+        failed = 0
+
+        logging.info(f"Syncing {total} rules using {workers} parallel workers...")
+
+        def sync_rule_wrapper(args):
+            """Wrapper to sync a single rule (reverse direction) and return result."""
+            child_rule, mgmt_rule = args
+            try:
+                return self.sync_single_rule_reverse(child_rule, mgmt_rule)
+            except Exception as e:
+                logging.error(f"Error syncing rule: {e}")
+                return False
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(sync_rule_wrapper, args): args for args in updates_needed}
+
+            for future in as_completed(futures):
+                completed += 1
+                result = future.result()
+                if result:
+                    updated += 1
+                else:
+                    failed += 1
+
+                # Progress indicator (overwrite line)
+                pct = 100 * completed // total
+                print(f"\rProgress: {completed}/{total} ({pct}%) - Updated: {updated}, Failed: {failed}", end='', flush=True)
+
+        print()  # Newline after progress
+
+        stats['rules_updated'] = updated
+        stats['rules_failed'] = failed
+
+        logging.info(f"Reverse sync complete: {updated} updated, {failed} failed, {stats['rules_skipped']} skipped")
+
+        return stats
+
+    def sync_single_rule_reverse(self, child_rule: Dict[str, Any], mgmt_rule: Dict[str, Any]) -> bool:
+        """
+        Reverse sync: copy props FROM child device rule TO management station rule.
+
+        Args:
+            child_rule: Source rule (child device) with props to copy
+            mgmt_rule: Target rule (management station) to update
+        """
+        # Get device IDs
+        child_device_id = child_rule.get('ndDevice', {}).get('id')
+        child_device_name = child_rule.get('ndDevice', {}).get('name', f'Device {child_device_id}')
+        mgmt_device_id = mgmt_rule.get('ndDevice', {}).get('id')
+
+        # Fetch ACTUAL current props from ruledoc API
+        try:
+            child_ruledoc = self.client.get_rule_doc(
+                self.config['domain_id'],
+                child_device_id,
+                child_rule['matchId']
+            )
+            child_props_raw = child_ruledoc.get('props')
+        except Exception as e:
+            logging.warning(f"Could not fetch child ruledoc, using SIQL data: {e}")
+            child_props_raw = child_rule.get('props')
+
+        try:
+            mgmt_ruledoc = self.client.get_rule_doc(
+                self.config['domain_id'],
+                mgmt_device_id,
+                mgmt_rule['matchId']
+            )
+            mgmt_props_raw = mgmt_ruledoc.get('props')
+        except Exception as e:
+            logging.warning(f"Could not fetch mgmt ruledoc, using SIQL data: {e}")
+            mgmt_props_raw = mgmt_rule.get('props')
+
+        # Quick check: if child has no props, skip (nothing to copy)
+        if not child_props_raw:
+            logging.debug(f"Child rule has no props, skipping '{child_rule.get('displayName')}'")
+            return True
+
+        # Convert child props (SOURCE) to dict format
+        if isinstance(child_props_raw, dict):
+            child_props_dict = child_props_raw
+        elif isinstance(child_props_raw, list):
+            child_props_dict = {}
+            for prop in child_props_raw:
+                key = prop.get('ruleCustomPropertyDefinition', {}).get('key') or \
+                      prop.get('customProperty', {}).get('key')
+                if key:
+                    if 'stringval' in prop:
+                        child_props_dict[key] = prop['stringval']
+                    elif 'stringarray' in prop:
+                        child_props_dict[key] = prop['stringarray']
+                    elif 'integerval' in prop:
+                        child_props_dict[key] = prop['integerval']
+                    elif 'booleanval' in prop:
+                        child_props_dict[key] = prop['booleanval']
+                    elif 'dateval' in prop:
+                        child_props_dict[key] = prop['dateval']
+                    elif 'usernameval' in prop:
+                        child_props_dict[key] = prop['usernameval']
+        else:
+            logging.error(f"Child props is not a dict or list: {type(child_props_raw)}")
+            return False
+
+        # Get mgmt props in list format for merging
+        if isinstance(mgmt_props_raw, dict):
+            mgmt_props_list = self._convert_props_dict_to_list(mgmt_props_raw, mgmt_rule['matchId'])
+        elif isinstance(mgmt_props_raw, list):
+            mgmt_props_list = mgmt_props_raw
+        else:
+            mgmt_props_list = []
+
+        # Build the merged props list - values from CHILD, structure from mgmt
+        new_props = self._merge_props_for_sync(child_props_dict, mgmt_props_list, mgmt_rule['matchId'])
+
+        # Build rule doc for update to MANAGEMENT STATION
+        rule_doc = {
+            'ruleId': mgmt_rule['matchId'],
+            'deviceId': mgmt_device_id,
+            'createDate': None,
+            'lastUpdated': None,
+            'lastRevisionDate': None,
+            'props': new_props,
+            'expirationDate': None
+        }
+
+        try:
+            logging.info(f"Updating mgmt rule '{mgmt_rule.get('displayName')}' with props from {child_device_name}")
+            logging.debug(f"  Child device props: {child_props_dict}")
+            logging.debug(f"  New mgmt props: {new_props}")
+
+            self.client.update_rule_doc(
+                self.config['domain_id'],
+                mgmt_device_id,
+                rule_doc
+            )
+
+            logging.info(f"  Successfully synced props (reverse)")
+            return True
+
+        except requests.exceptions.HTTPError as e:
+            error_msg = f"  Failed to sync props: {e}"
+            if hasattr(e, 'response') and e.response is not None:
+                error_msg += f"\n  Response: {e.response.text}"
+            logging.error(error_msg)
+            return False
+        except Exception as e:
+            logging.error(f"  Failed to sync props: {e}")
+            return False
+
     def sync_child_device(self, mgmt_rules: List[Dict[str, Any]],
                          child_device: Dict[str, Any]) -> Dict[str, int]:
         """Sync rules from management station to a single child device."""
@@ -1713,16 +2005,25 @@ class RuleDocSyncer:
             logging.error(f"  Failed to sync props: {e}")
             return False
     
-    def run(self, mgmt_station_id: Optional[int] = None) -> int:
-        """Main execution method."""
+    def run(self, mgmt_station_id: Optional[int] = None, reverse: bool = False,
+            device_group_id: Optional[int] = None) -> int:
+        """Main execution method.
+
+        Args:
+            mgmt_station_id: Optional specific management station ID to sync
+            reverse: If True, sync FROM child devices TO management station
+            device_group_id: Optional device group ID to filter child devices
+        """
         if not self.initialize():
             return 1
-        
+
         try:
             # Get management stations to sync
             if mgmt_station_id:
                 # Sync specific management station
-                logging.info(f"Syncing specific management station ID: {mgmt_station_id}")
+                direction = "REVERSE (Child → Mgmt)" if reverse else "(Mgmt → Child)"
+                group_info = f" [Group: {device_group_id}]" if device_group_id else ""
+                logging.info(f"Syncing specific management station ID: {mgmt_station_id} {direction}{group_info}")
                 mgmt_stations = [{'id': mgmt_station_id, 'name': f'Management Station {mgmt_station_id}'}]
             else:
                 # Get all management stations
@@ -1730,7 +2031,7 @@ class RuleDocSyncer:
                 if not mgmt_stations:
                     logging.warning("No management stations found")
                     return 0
-            
+
             # Process each management station
             total_stats = {
                 'mgmt_stations': len(mgmt_stations),
@@ -1743,7 +2044,12 @@ class RuleDocSyncer:
             }
 
             for mgmt_station in mgmt_stations:
-                stats = self.sync_management_station(mgmt_station)
+                # Choose sync direction
+                if reverse:
+                    stats = self.sync_management_station_reverse(mgmt_station, device_group_id)
+                else:
+                    stats = self.sync_management_station(mgmt_station, device_group_id)
+
                 total_stats['child_devices'] += stats['child_devices']
                 total_stats['rules_matched'] += stats['rules_matched']
                 total_stats['rules_updated'] += stats['rules_updated']
@@ -1752,10 +2058,11 @@ class RuleDocSyncer:
                 total_stats['rules_no_match'] += stats['rules_no_match']
 
             # Print summary
+            sync_direction = "REVERSE (Child → Mgmt)" if reverse else "(Mgmt → Child)"
             summary = [
                 "",
                 "=" * 80,
-                "Sync Summary:",
+                f"Sync Summary {sync_direction}:",
                 "=" * 80,
                 f"Management stations processed: {total_stats['mgmt_stations']}",
                 f"Child devices processed: {total_stats['child_devices']}",
@@ -1771,7 +2078,7 @@ class RuleDocSyncer:
             logging.info("\n".join(summary))
 
             return 0 if total_stats['rules_failed'] == 0 else 1
-            
+
         except Exception as e:
             logging.error(f"Error during sync: {e}", exc_info=True)
             return 1
@@ -1851,12 +2158,20 @@ Environment Variables:
 Examples:
   # Test connection
   python3 sync_ruledoc.py --test
-  
-  # Sync all management stations
+
+  # Sync all management stations (mgmt → child)
   python3 sync_ruledoc.py
-  
+
   # Sync specific management station
   python3 sync_ruledoc.py --mgmt-id 1289
+
+  # Reverse sync (child → mgmt)
+  python3 sync_ruledoc.py --reverse
+  python3 sync_ruledoc.py --reverse --mgmt-id 1289
+
+  # Filter to specific device group
+  python3 sync_ruledoc.py --device-group-id 123
+  python3 sync_ruledoc.py --reverse --device-group-id 123
         """
     )
     
@@ -1885,6 +2200,19 @@ Examples:
         help='Number of parallel workers for API calls (default: 5)'
     )
 
+    parser.add_argument(
+        '--reverse',
+        action='store_true',
+        help='Reverse sync: copy props FROM child devices TO management station'
+    )
+
+    parser.add_argument(
+        '--device-group-id',
+        type=int,
+        default=None,
+        help='Only sync devices in this device group ID'
+    )
+
     args = parser.parse_args()
 
     # Initialize FireMon environment
@@ -1909,7 +2237,7 @@ Examples:
         sys.exit(0 if success else 1)
     else:
         syncer = RuleDocSyncer(config)
-        sys.exit(syncer.run(args.mgmt_id))
+        sys.exit(syncer.run(args.mgmt_id, reverse=args.reverse, device_group_id=args.device_group_id))
 
 
 if __name__ == "__main__":

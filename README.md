@@ -11,6 +11,7 @@ This script solves the problem of keeping rule documentation synchronized betwee
 - Automatically discovers all management stations in a domain
 - Matches rules between management stations and child devices based on rule definitions
 - Syncs custom property values from management station rules to child device rules
+- **Reverse sync** option to copy props FROM child devices TO management station
 - Supports all custom property types (STRING, INTEGER, DATE, BOOLEAN, etc.)
 - Handles authentication with token refresh
 - **Interactive prompts** for credentials when environment variables are not set
@@ -99,6 +100,39 @@ python3.12 sync_ruledoc.py --workers 10
 
 # Use fewer workers to reduce server load
 python3.12 sync_ruledoc.py --workers 2
+```
+
+### Reverse Sync (Child → Management Station)
+
+Copy rule documentation FROM child devices TO the management station:
+
+```bash
+# Reverse sync all management stations
+python3.12 sync_ruledoc.py --reverse
+
+# Reverse sync specific management station
+python3.12 sync_ruledoc.py --reverse --mgmt-id 1289
+```
+
+**How reverse sync works:**
+- Reads props from child device rules
+- Updates matching management station rules with those props
+- When multiple children have props for the same rule, **first match wins**
+- Useful when documentation was added on child devices and needs to be propagated up
+
+### Filter by Device Group
+
+Limit sync to only child devices in a specific device group:
+
+```bash
+# Forward sync - only to devices in group 123
+python3.12 sync_ruledoc.py --device-group-id 123
+
+# Reverse sync - only from devices in group 123
+python3.12 sync_ruledoc.py --reverse --device-group-id 123
+
+# Combined with management station
+python3.12 sync_ruledoc.py --reverse --mgmt-id 195 --device-group-id 123
 ```
 
 ### Running as a Cron Job
@@ -329,6 +363,16 @@ For issues or questions:
 4. Review FireMon API documentation
 
 ## Version History
+
+- **1.3**: Device group filtering
+  - New `--device-group-id` option to filter child devices by device group
+  - Works with both forward and reverse sync
+  - Useful for syncing only specific device groups
+
+- **1.2**: Reverse sync feature
+  - New `--reverse` flag to sync FROM child devices TO management station
+  - Useful when documentation was added on child devices first
+  - First match wins when multiple children have different props for same rule
 
 - **1.1**: Performance and usability improvements
   - Interactive prompts for credentials when environment variables not set
